@@ -620,7 +620,60 @@ games are explicitly *non-goals* for the scripted/remote tiers.
 
 ---
 
-## 14. Open questions to resolve next
+## 14. UI architecture: one core, swappable frontends
+
+> [!abstract] The decision
+> **Do not embed a TS UI runtime in the Go binary.** Decouple the UI behind a
+> protocol, ship a native default renderer, and let alternative frontends attach as
+> *clients*. This is exactly OpenCode's proven, shipping architecture.
+
+**Reference point (same team builds both):** OpenTUI and OpenCode are from
+Anomaly/SST. OpenCode is **client/server** — core agent runs as a local server
+(TS/Bun/Hono, HTTP+SSE), the **default TUI is Go + Bubble Tea acting as a client**,
+and desktop/IDE/CI are other clients on the same server via a typed SDK. OpenTUI
+itself is **TypeScript + a Zig core + the Bun runtime** (≥1.2, native lib via
+`Bun.dlopen` FFI). Even the OpenTUI authors put a *protocol* between core and UI
+rather than embedding the UI in the agent.
+
+| Option | Verdict | Why |
+|---|---|---|
+| **A. Charmbracelet (Bubble Tea) compiled in** | ✅ default renderer | Pure Go, single static binary, no JS runtime. OpenCode's own TUI proves it for a coding agent. |
+| **B. Embed OpenTUI + Bun in the binary** | ❌ avoid | Bundling Bun (~90MB) + a Zig native lib + Go↔TS FFI reintroduces the exact runtime Go removed, ~doubles size, couples the hot path. Defeats single-binary. |
+| **C. Decouple UI behind a protocol** | ✅ the architecture | Default frontend = A (in-process). Alternatives (OpenTUI/TS, web, IDE) attach as separate client processes. Core never imports Bun. |
+
+**Charmbracelet maps 1:1 onto the §13 declarative vocabulary** — so the default
+renderer is "wire each element to a Charm component":
+
+| Declarative element | Charmbracelet |
+|---|---|
+| `list` | `bubbles/list` |
+| `table` | `lipgloss` table / `bubbles/table` |
+| `form` | `huh` |
+| `markdown` | `glamour` |
+| `progress` / `spinner` / `input` | `bubbles` |
+| styling / layout | `lipgloss` |
+
+> [!tip] "Users configure the UI in TypeScript" — satisfied by C, not by embedding
+> They write a **frontend** (or just theme/layout via the SDK) against the protocol,
+> as a separate process. You get web and IDE frontends for free, and the Go core
+> stays a single static binary.
+
+> [!note] The unification
+> The UI is just **another client of the Transport** (§12). Default = in-process Go
+> Bubble Tea over channels; remote = any frontend over NATS / HTTP-SSE. "Headless
+> core + swappable frontends" then falls out for free — and it already matches the
+> PRD's **human mode** (TUI observes/steers a mesh) and **headless mode**
+> (controllable via NATS). The UI boundary and the extension/mesh boundary are the
+> same idea twice.
+
+**Recommendation:** Charmbracelet default, compiled in, decoupled behind the UI
+protocol. OpenTUI = optional alternative frontend, never a bundled dependency.
+Light customization = declarative vocabulary (config/theme, no code); heavy/custom
+UI = write a client.
+
+---
+
+## 15. Open questions to resolve next
 
 - [ ] Starlark builtin surface: full `pi.*` list + which are load-phase vs runtime.
 - [ ] Declarative widget protocol spec (what shapes `ctx.ui.*` accepts/returns).
