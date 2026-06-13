@@ -673,7 +673,93 @@ UI = write a client.
 
 ---
 
-## 15. Open questions to resolve next
+## 15. TUI rendering, the Go way (studied from Crush)
+
+I cloned **Charmbracelet Crush** and traced its rendering end-to-end. It's the
+reference blueprint for "a simple thing like pi, done the Go way," and it validates
+§14 concretely. Crush uses `bubbletea/v2` + `lipgloss/v2` + `bubbles/v2` +
+`glamour/v2`, and its agent loop rides `charm.land/fantasy`.
+
+### The event pipeline (this is the pattern to borrow)
+
+```mermaid
+flowchart LR
+    subgraph services["services (each owns a Broker[T])"]
+        M["Messages Broker"]
+        S["Sessions Broker"]
+        A["agent / LSP Brokers"]
+    end
+    M & S & A -->|setupSubscriber fan-in| AGG["app.events:<br/>Broker[tea.Msg]"]
+    AGG -->|"app.Subscribe(program):<br/>for ev := range ch { program.Send(ev) }"| TEA["Bubble Tea program<br/>Update(msg) / View()"]
+    TEA --> R["lipgloss / bubbles / glamour render"]
+```
+
+Four moves, all worth copying verbatim:
+
+1. **Generic `pubsub.Broker[T]` over channels** — the canonical Go form of pi's
+   `EventStream`. `Subscribe(ctx) <-chan Event[T]`; a goroutine unsubscribes on
+   `ctx.Done()`. Per-subscriber buffered channels (Crush uses 4096), drop counters
+   for telemetry.
+
+2. **Two delivery semantics** (the lesson pi's single stream lacks):
+   - `Publish` — **lossy, non-blocking.** If a subscriber is slow, drop the event.
+     Correct for high-frequency streaming token deltas ("only latest matters").
+   - `PublishMustDeliver(ctx)` — **bounded-blocking** (~50ms/subscriber timeout).
+     For terminal events (finish, tool result, error, cancel) that must not be
+     silently coalesced away.
+
+3. **Fan-in aggregation** — `setupSubscriber[T]` goroutines read each service's
+   `Broker[T]` and re-publish onto a single `app.events: Broker[tea.Msg]`. The UI
+   subscribes to *one* stream of `tea.Msg`. (Terminal events use the
+   `setupSubscriberMustDeliver` variant.)
+
+4. **`program.Send` bridge** — `app.Subscribe(program)` runs one goroutine:
+   `for ev := range app.events.Subscribe(ctx) { program.Send(ev.Payload) }`. That's
+   the entire seam between the headless core and Bubble Tea.
+
+### The decoupling from §14, made concrete
+
+Crush has a **`Workspace`** abstraction with two implementations that both expose
+`Subscribe(program *tea.Program)`:
+
+- **`AppWorkspace`** — in-process; fans the local brokers into `program.Send`.
+- **`ClientWorkspace`** — remote; `client.SubscribeEvents(ctx)` reads events over a
+  **Unix socket** (Crush ships an HTTP/swagger API server, `internal/server`) and
+  feeds the *same* `program.Send`.
+
+So the **identical Bubble Tea model** runs against either an in-process app or a
+remote server — which is exactly our "UI is just another Transport client" claim,
+already shipping. (`crush run` headless mode reuses the same event stream with no
+TUI — the `MustDeliver` terminal events are what keep it from hanging.)
+
+### Pi vs Crush rendering
+
+| | Pi (`pi-tui`) | Crush (Charm) |
+|---|---|---|
+| Model | custom **differential renderer**; `Component.render(w)→lines` + `invalidate()` | **Elm / Bubble Tea**: `Init/Update/View`, message passing |
+| Events → UI | `agent.subscribe(fn)` listener set; `EventStream` async iterator | `Broker[T]` channels → fan-in → `program.Send` |
+| Layout/style | hand-rolled | `lipgloss` (+ `bubbles` widgets, `glamour` markdown) |
+| Remote | RPC mode | `Workspace` iface (in-proc vs socket client) |
+
+### Recommendation
+
+Adopt Crush's spine wholesale: **`pubsub.Broker[T]` (two delivery modes) → fan-in →
+`program.Send` → a Bubble Tea root model composing sub-models (chat / sidebar /
+status), rendered with lipgloss + bubbles + glamour.** Do **not** hand-roll a
+differential renderer like `pi-tui` — Bubble Tea + lipgloss v2 already own that.
+Put a `Workspace` interface at the event boundary so in-process and socket frontends
+are the same model (this *is* §14's UI protocol, concretely).
+
+> [!note] On `fantasy` / `catwalk`
+> Crush's loop rides `charm.land/fantasy` (agent + `AgentTool`) and `catwalk`
+> (provider catalog). Worth a look, but we likely keep **our own loop** — pi's
+> steering/follow-up + the extension combine-policies (§3–§4) are exactly the
+> control we'd lose by adopting someone else's loop. Borrow the *rendering* spine
+> from Crush; keep the *agent core* ours.
+
+---
+
+## 16. Open questions to resolve next
 
 - [ ] Starlark builtin surface: full `pi.*` list + which are load-phase vs runtime.
 - [ ] Declarative widget protocol spec (what shapes `ctx.ui.*` accepts/returns).
