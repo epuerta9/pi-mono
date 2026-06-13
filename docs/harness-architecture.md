@@ -312,7 +312,214 @@ graph TD
 
 ---
 
-## 7. Open questions to resolve next
+## 7. What extensions actually look like (three philosophies)
+
+Pi ships ~50 example extensions. Catalogued, they fall into a few classes:
+interception (`permission-gate`, `protected-paths`, `dirty-repo-guard`), custom
+tools (`todo`, `question`, `antigravity-image-gen`, `ssh`), custom **providers**
+(`custom-provider-anthropic` — full OAuth/PKCE + streaming), rich UI
+(`snake`, `doom-overlay`, `modal-editor`), and **subagents** (`subagent/` spawns
+separate `pi` processes). The lesson: *almost every extension is glue + a
+capability call + a result* — they don't implement hard algorithms in the
+extension language. That's what makes a scripting tier viable.
+
+Three philosophies for *where the real work lives*:
+
+```python
+# A. Logic in Starlark (trivial glue) — uses the RICH SDK, not exec
+def diff_cmd(args, ctx):
+    changes = ctx.git.status()                 # structured, Go-backed (NOT stdout parsing)
+    if not changes: ctx.ui.notify("clean"); return
+    pick = ctx.ui.select("Diff", [c.path for c in changes])
+    if pick: ctx.editor.open_diff(pick)
+
+# B. Logic delegated to the author's own code (WASM guest / NATS service)
+def query_db(call_id, args, ctx):
+    return ctx.call("db-service", {"sql": args["sql"]})   # structured request/reply
+
+def setup(pi):
+    pi.register_command("diff", diff_cmd)
+    pi.register_tool(name="query_db", parameters={...}, execute=query_db)
+```
+
+> [!warning] Avoid the exec+stdout anti-pattern
+> A *thin* SDK (only `exec`) forces everyone to shell out and parse stdout. The
+> fix is a **rich, structured SDK** (`ctx.git.status()` → typed values), not
+> dropping the scripting tier. `exec` becomes a rare "wrap an unknown CLI" hatch.
+
+> [!tip] Agent-authored extensions
+> Because Starlark is sandboxed, it's the *safe* target for the agent writing its
+> own extensions at runtime (the self-writing-software idea). It cannot brick the
+> host or exfiltrate secrets unless granted a builtin. Pi's TS extensions run with
+> **full host privileges** — a property we deliberately improve on.
+
+---
+
+## 8. One SDK, multiple bindings
+
+> [!abstract] The core principle
+> There is **one** logical extension SDK — the surface mirroring pi's
+> `ExtensionAPI` + `ExtensionContext`. It is *defined once* (in Go) and *projected*
+> into each tier via a different binding. Authors learn one surface; we maintain
+> one contract.
+
+| pi surface | Go-backed Starlark builtin | WASM guest-SDK signature | NATS subject |
+|---|---|---|---|
+| `pi.on("tool_call", h)` | `pi.on("tool_call", fn)` | `sdk.On(ToolCall, fn)` | sub `ext.hook.tool_call` |
+| `pi.registerTool(t)` | `pi.register_tool(...)` | `sdk.RegisterTool(t)` | adv `ext.tool.register` |
+| `ctx.exec(cmd,args)` | `ctx.exec(...)` | `sdk.Exec(...)` (host fn) | req `ext.exec` |
+| `ctx.ui.select(...)` | `ctx.ui.select(...)` | `sdk.UI.Select(...)` | req `ext.ui.select` |
+| `ctx.sessionManager.getBranch()` | `ctx.session.branch()` | `sdk.Session.Branch()` | req `ext.session.branch` |
+| `pi.registerProvider(...)` | (compiled-in only) | (compiled-in only) | n/a |
+
+**Why this matters:** "an SDK both the author and our binary import" is only
+*literally* possible when author-language == host-language. With Starlark there is
+no library import — the SDK *is* the injected builtins (Go side) the author calls
+(Starlark side). With WASM the SDK is genuinely **split**: a **guest half** the
+author imports + a **host half** we embed, talking over host-functions. Same
+surface, three transports. UI stays host-owned everywhere (declarative specs in,
+chosen values out) because no remote/sandboxed tier can hold a live `Component`.
+
+---
+
+## 9. WASM: what it can and can't do (the http question, grounded)
+
+The "WASM can't do HTTP / networking" worry is **mostly a myth** — it's
+capability-gated, not impossible:
+
+- **WASI 0.2 (Preview 2)**, stabilized late 2024, ships `wasi-http` (outgoing +
+  incoming HTTP) via the Component Model. Runtimes are adopting it; `wazero` (the
+  pure-Go host) supports WASI with component-model support evolving.
+- **Extism** exposes `extism_http_request` as a built-in host function *today* —
+  so a guest can do HTTP now, **but**: it's **synchronous** (one request at a
+  time, blocks), and the host **must explicitly allow** target hosts (deny-by-
+  default). That gate is a *feature* for untrusted extensions.
+
+> [!note] The real WASM limits (be honest about these)
+> - **Boundary is serialization** — no shared pointers; big payloads get copied.
+> - **Sync / weak concurrency** — no goroutines; async is awkward until WASI
+>   Preview 3 (native async, ~2026).
+> - **Go→wasm maturity** — TinyGo for small artifacts (stdlib subset) or stock Go
+>   `GOOS=wasip1` (large binaries). Rust is the smoothest guest.
+> - **No live host objects** — so rich/animated TUI (`snake`, `doom-overlay`)
+>   stays compiled-in Go, not WASM.
+>
+> Verdict: WASM is *fine* for sandboxed, structured, request/response compute in a
+> real language (the `query_db` case). It is *not* the tier for live UI, heavy
+> concurrency, or long-lived stateful services. For those, see §10.
+
+---
+
+## 10. The NATS broker extension model (the heavyweight tier)
+
+> [!abstract] The idea
+> Embed a NATS server in the harness. Extensions are **long-lived external
+> processes** (any language) that connect to the bus. Hook events flow to NATS
+> **subjects**; extensions subscribe and reply. Starlark becomes the **routing +
+> policy brain** that declares which hooks map to which subjects and the fan-out
+> order. The harness **supervises** the extension processes. Clients use our
+> **client SDK** to attach and exchange rich structured data.
+
+This is the right tier for **persistent, stateful, possibly-remote, any-language**
+extensions — and it unifies with the [[prd-nats-agent-mesh]] vision ("every agent
+is the infrastructure").
+
+### Subjects mirror the two kinds of hooks
+
+```
+ext.hook.turn_end          (pub/sub  — observers: fire-and-forget)
+ext.hook.tool_call         (request/reply — interceptors: harness BLOCKS for reply)
+ext.hook.context           (request/reply — chained by the runner, in order)
+ext.tool.<name>.invoke     (request/reply — LLM-callable tools)
+ext.ui.select / .notify    (request/reply — host renders, returns value)
+_INBOX.*                   (NATS auto reply-subjects)
+```
+
+NATS has **built-in request/reply** (`nc.Request` with timeout, point-to-point on
+an auto `_INBOX`), so interceptors map cleanly: harness publishes a request, waits
+for the decision, applies block/allow. Observers are plain pub/sub. **Chaining**
+(the `context` hook) is *orchestration in the runner*: request → feed result into
+the next subscriber → repeat (NATS req/reply is point-to-point, not a fan-in
+reducer, so the runner sequences it). **Queue groups** give free load-balancing if
+an extension runs N replicas.
+
+### Supervision — the part that was unclear
+
+NATS is a **broker, not a process manager**. Keeping extensions alive is a separate
+concern, solved with an Erlang-style **supervisor tree** — `github.com/thejerf/suture/v4`
+is the standard Go library (context-aware, **backoff** so a crash-looping child
+doesn't peg the CPU, failure-rate/threshold, composable trees).
+
+```mermaid
+graph TD
+    Root["Supervisor (root)"]
+    Root --> Bus["embedded NATS server"]
+    Root --> Loop["agent loop(s)"]
+    Root --> EM["ExtensionManager (supervisor)"]
+    EM -->|spawn + restart w/ backoff| E1["db-service (proc)"]
+    EM -->|spawn + restart w/ backoff| E2["lint-service (proc)"]
+    E1 -. heartbeat ext.health.db .-> EM
+    E2 -. heartbeat ext.health.lint .-> EM
+    E1 -. subscribe ext.hook.* .-> Bus
+    E2 -. subscribe ext.hook.* .-> Bus
+```
+
+Lifecycle: a **child spec** = `{cmd, restartPolicy, healthSubject}`. The manager
+spawns the process, then tracks liveness two ways — OS process exit (re-spawn with
+backoff) **and** a NATS **heartbeat/presence** (extension publishes `ext.health.X`
+every Ns; missed beats ⇒ kill + restart). This is exactly OTP "one-for-one"
+restart. Capability/secret isolation comes from **NATS accounts + subject
+permissions** (a community extension simply can't subscribe to `secrets.*`).
+
+### How this maps to pi
+
+| pi mechanism | NATS-model equivalent |
+|---|---|
+| `ExtensionRunner.emit(observer)` | `nc.Publish("ext.hook.turn_end", data)` |
+| `emitToolCall` (can block) | `nc.Request("ext.hook.tool_call", ...)` → decision |
+| `emitContext` (chain) | runner sequences req/reply across subscribers |
+| `registerTool` | extension advertises `ext.tool.<name>`; harness wraps it as an `AgentTool` |
+| jiti loading `.ts` | supervisor spawning + health-checking processes |
+| `pi.exec` | just another request subject |
+| rich UI components | **stays host-side**; UI flows as data over `ext.ui.*` |
+
+So the NATS model doesn't replace pi's extension *semantics* — it keeps them
+(observers, interceptors, tools, the combine policies) and swaps the *transport*
+from in-process function calls to a message bus. The win over MCP-stdio: persistent
+connections (no per-call fork), bidirectional streaming, language-agnostic via 30+
+NATS clients, **distribution** (extensions on other machines), and a single bus
+shared by extensions, subagents, and mesh peers.
+
+> [!warning] The two real costs
+> 1. **Hot-path latency.** Interceptors block the loop; routing *every* `tool_call`
+>    through a bus adds a serialization + round-trip hop (sub-ms locally, but real).
+>    → Don't bus the local 80%. Keep glue/interception in in-process Starlark;
+>    reserve NATS for extensions that genuinely need to be separate processes.
+> 2. **Operational weight.** A broker + supervisor tree + subject authz is a lot
+>    for someone who just wants `/diff`. It's the *top* tier, not the default.
+
+### The unified picture — let the need pick the tier
+
+```mermaid
+graph LR
+    Core["Go core (compiled-in)<br/>providers, rich UI, the loop"]
+    SL["Starlark + rich SDK<br/>(in-process: glue, commands,<br/>interception, ROUTING brain)"]
+    WASM["WASM + split SDK<br/>(sandboxed real-language compute)"]
+    NATS["NATS-attached services<br/>(persistent, remote, any-language)"]
+    SL -->|delegates heavy| WASM
+    SL -->|routes subjects| NATS
+    Core --- SL
+    NATS -. same bus .- Mesh["subagents / mesh peers"]
+```
+
+Starlark is the brain in the middle: it handles the common case in-process **and**
+decides, per hook, whether to answer inline, call a WASM module, or route to a NATS
+subject. That is the literal realization of your earlier instinct — *"Starlark as
+config for which channel/subject the data moves through."*
+
+---
+
+## 11. Open questions to resolve next
 
 - [ ] Starlark builtin surface: full `pi.*` list + which are load-phase vs runtime.
 - [ ] Declarative widget protocol spec (what shapes `ctx.ui.*` accepts/returns).
