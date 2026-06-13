@@ -519,7 +519,108 @@ config for which channel/subject the data moves through."*
 
 ---
 
-## 11. Open questions to resolve next
+## 11. Self-writing extensions — pi's reality vs. what we can do better
+
+> [!warning] Correction to a common belief
+> Pi's canonical docs are explicit: **there is no first-class API for an extension
+> (or the agent) to generate other extensions at runtime.** No "write a new
+> extension" call.
+
+What pi *does* have, which *composes* into self-extension:
+
+- the agent's own `write` + `bash` tools (it can drop a `.ts` into `.pi/extensions/`),
+- **hot-reload** — `/reload` and `ctx.reload()` (emits `session_shutdown` → reload →
+  `session_start{reason:"reload"}`), plus `dynamic-tools.ts` (register tools after
+  startup).
+
+So "pi writes its own extensions in flight" is an **emergent** capability (write a
+file, then reload), not a designed one. And here's the catch that makes it
+dangerous in pi:
+
+> [!danger] Pi extensions have ZERO sandboxing
+> The docs literally warn: *"Extensions run with your full system permissions and
+> can execute arbitrary code. Only install from sources you trust."* No capability
+> isolation, no resource limits. Pi's sandboxing is **bolted on per-extension at
+> the OS level** — `sandbox/` (`@anthropic-ai/sandbox-runtime`) and `gondolin/`
+> (routes tools into a micro-VM). It is not a property of the extension system.
+
+**This is our single biggest opportunity.** Make self-extension *first-class AND
+safe*: the agent emits a **`.star`**, the harness hot-reloads it, and because
+Starlark is sandboxed, a hallucinated or prompt-injected extension **cannot**
+`rm -rf`, read `~/.ssh`, or phone home unless we granted a builtin. The agent gets
+to extend itself at runtime — the thing you care about — *without* the arbitrary-
+code risk that makes it reckless in pi. The capability isolation pi structurally
+lacks is exactly what makes machine-authored extensions viable.
+
+---
+
+## 12. The broker is an implementation detail (Transport interface)
+
+Don't hardwire NATS. Put a **`Transport` interface** between the runner and the
+wire; the broker becomes swappable.
+
+```go
+type Transport interface {
+    Publish(subject string, data []byte) error                       // observers
+    Request(subject string, data []byte, timeout time.Duration) ([]byte, error)  // interceptors
+    Subscribe(subject string, fn func(Msg)) (Sub, error)
+}
+```
+
+| Implementation | When | Notes |
+|---|---|---|
+| **InProcess** (Go channels) | **default**, local 80% | zero deps, zero latency, no broker at all |
+| **NATS** (embedded) | cross-process / remote / mesh | one binary, sub-ms, JetStream persistence |
+| **gRPC** (streams) | point-to-point services | see caveat below |
+| Redis / Watermill adapter | if already in the stack | not recommended to start |
+
+> [!note] NATS licensing — safe, with a footnote
+> NATS **core is Apache 2.0**, stewarded by the **CNCF**. There was an Apr–May 2025
+> dispute where Synadia (97% of contributions) tried to relicense future work to
+> **BSL** and pull NATS from CNCF; it was resolved — stewardship and the Apache-2.0
+> line **stayed with CNCF**. So: **no commercial-use problem today.** Residual risk
+> = Synadia's future work could diverge under BSL. Mitigation: the `Transport`
+> interface means NATS is never load-bearing — you can swap it.
+
+> [!caution] gRPC is **not** a broker
+> gRPC = point-to-point RPC + bidirectional streaming. It has **no pub/sub fan-out,
+> no decoupled discovery, no persistence**. It can implement the *request/reply* and
+> *streaming* legs (a fine `Transport` for the RPC subset), but you'd rebuild
+> service registry + fan-out + mesh yourself. Use it for "call one known service,"
+> not "broadcast a hook to N unknown subscribers." For the mesh, embedded NATS is
+> the Go-native answer (NATS *is* written in Go — you import the server).
+
+**The payoff of abstracting it:** the *same extension contract* holds whether the
+transport is in-process channels or a remote NATS subject. An extension can
+**graduate** — prototyped as in-process Starlark, later promoted to a supervised,
+possibly-remote service — with **zero API change**. Start with InProcess; turn on
+NATS only when you actually cross a boundary.
+
+---
+
+## 13. UI richness — how far the declarative protocol reaches
+
+Every non-core tier (Starlark, WASM, NATS) hits the **same wall**: it cannot hold a
+live host `Component`. So the question is how much UI you can do *declaratively*.
+
+- **Out of reach** (stays compiled-in Go): live, per-frame, interactive UI —
+  `snake`, `tic-tac-toe`, `doom-overlay` (35 FPS), custom modal editors. These need
+  live components + raw input loops.
+- **Well within reach** (declarative): `select`, `confirm`, `input`, `notify`,
+  `setStatus`, `setWidget(string[])`, custom footer/header *data*, multi-question
+  forms (`questionnaire`), streaming progress text. This is the overwhelming
+  majority of what real extensions actually use.
+
+The model: **host owns rendering; the extension sends a structured *view spec* and
+receives *events/values* back.** To push richness further without giving up the
+sandbox, define a small **declarative component vocabulary** — `list`, `table`,
+`form`, `markdown`, `keyvalue`, `progress` — a "tiny HTML for the TUI." The host
+renders it; the extension just emits data and reads results. Animated/interactive
+games are explicitly *non-goals* for the scripted/remote tiers.
+
+---
+
+## 14. Open questions to resolve next
 
 - [ ] Starlark builtin surface: full `pi.*` list + which are load-phase vs runtime.
 - [ ] Declarative widget protocol spec (what shapes `ctx.ui.*` accepts/returns).
