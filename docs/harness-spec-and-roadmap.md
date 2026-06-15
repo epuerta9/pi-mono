@@ -82,11 +82,38 @@ graph LR
 
 ### Beyond the wedge (delivery order)
 
-`InProcess` everything → **2.** compaction + caching (Part II, pure wins) →
-**3.** WASM tier → **4.** `Transport=NATS` + supervised services → **5.** mesh +
-alternate frontends. Each step is additive; none rewrites the wedge.
+**1.** `InProcess` everything (the wedge) → **2.** compaction + caching (Part II,
+pure wins) → **3.** observability trace core (see below) → **4.** WASM tier →
+**5.** `Transport=NATS` + supervised services → **6.** mesh + alternate frontends.
+Each step is additive; none rewrites the wedge.
+
+### Observability deliveries (full plan in [[observability-gameplan]])
+
+Cheap to add because the events already flow off the `Broker`; slots in right after
+the pure-cost-win work:
+
+- **O1 — trace core:** `Broker → 3-table SQLite` (traces/observations/scores) +
+  `--trace` flag + a `pi traces` Bubble Tea view. Optional OTLP export to
+  Langfuse/otel-tui. *This is the "see our traces" milestone.*
+- **O2 — scores + compare:** `pi traces compare A B` (trajectory + metric diff).
+- **O3 — experiment runner:** N harness configs × a task set → score → compare
+  (the tuning loop; cheap via goroutines).
+- **O4 — probe + self-heal:** the harness queries its own store in-process
+  (looping? cost spike? tool failing?) → feeds `LoopConfig`. No external dep.
+
+### Sandbox / isolation (full analysis in [[sandboxing-models]])
+
+Two schools: **(A) sandbox-as-hands** (harness on host, tool ops routed into a
+sandbox backend — what pi and deepagents do) vs **(B) harness-in-sandbox** (the
+single static binary runs *inside* a microVM, orchestrated from outside). Go favors
+**B as the primary secure story** (the static binary makes the VM image trivial; the
+harness path stays clean), with **A retained as a lighter secondary seam** via a
+pluggable `Operations` interface. Both reduce to the same I/O contract we already
+have — prompts in / events+traces out / resumable sessions = the `Workspace` +
+`Transport` boundary (§14, [[harness-architecture]]).
 
 ---
+
 
 # Part II — The Optimization & Novel-Harness Frontier
 

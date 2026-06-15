@@ -27,6 +27,8 @@ or symlink it into an existing vault. All notes use mermaid + callouts +
   the baked-in agent-native "Traces" tab vs Langfuse.
 - [[observability-gameplan]] — Langfuse's 3-table model analyzed; phased plan for a
   lightweight SQLite trace core → compare harnesses → probe/self-heal.
+- [[sandboxing-models]] — sandbox-as-hands vs harness-in-sandbox; why Go favors the
+  binary-in-a-microVM model; pi/deepagents both do the former.
 - [[storage-and-cgo]] — embeddable DB choice for a distributed CLI, the SQLite
   single-writer problem, and cgo vs pure Go.
 
