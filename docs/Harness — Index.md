@@ -19,6 +19,11 @@ or symlink it into an existing vault. All notes use mermaid + callouts +
 4. [[prd-nats-agent-mesh]] — **the endgame.** Embedded NATS agent mesh; broker as
    an implementation detail; supervision.
 
+### Deep dives
+
+- [[caching-and-control-surface]] — prompt caching (provider-owned vs harness-owned),
+  prefix cache-busters, and the ranked map of optimizations the harness controls.
+
 ## The one-paragraph thesis
 
 A Go core loop (goroutines/channels fit it beautifully) + Starlark for the
