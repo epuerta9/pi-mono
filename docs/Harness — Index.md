@@ -23,6 +23,10 @@ or symlink it into an existing vault. All notes use mermaid + callouts +
 
 - [[caching-and-control-surface]] — prompt caching (provider-owned vs harness-owned),
   prefix cache-busters, and the ranked map of optimizations the harness controls.
+- [[observability-and-self-healing]] — one Broker, two sinks; OTel SDK (not collector);
+  the baked-in agent-native "Traces" tab vs Langfuse.
+- [[storage-and-cgo]] — embeddable DB choice for a distributed CLI, the SQLite
+  single-writer problem, and cgo vs pure Go.
 
 ## The one-paragraph thesis
 
