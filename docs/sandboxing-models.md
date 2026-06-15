@@ -1,129 +1,137 @@
 # Sandboxing Models
 
-> Two schools of agent sandboxing, what pi and deepagents actually do, and which
-> fits the Go single-binary model. Companion to [[harness-architecture]] §11–12.
+> Two schools of agent sandboxing, which fits Go, and the concrete wedge: a full
+> isolated Linux VM running the binary. Companion to [[harness-architecture]] §11–12.
 
 ---
 
-## 1. Does pi have a sandbox subsystem? (and deepagents)
+## 1. The real question: where does the boundary cut?
 
-Neither has a *core* sandbox subsystem — both treat it as a **pluggable tool
-backend**, i.e. **School A** (below). Verified by cloning both:
+Both pi and deepagents do **School A** (verified by cloning): a pluggable tool
+**backend / operations** interface — deepagents' `SandboxBackendProtocol`
+(`execute/ls/read/write/edit/grep/glob/upload/download`), pi's `ssh.ts`
+(`Bash/Read/WriteOperations`). Neither runs the harness *inside* a sandbox.
 
-- **deepagents** (`backends/protocol.py`, `backends/sandbox.py`): a
-  `SandboxBackendProtocol` with `execute / ls / read / write / edit / grep / glob /
-  upload_files / download_files`. The file/exec tools dispatch to a `Backend` —
-  `state`, `local_shell`, `store`, or `sandbox` (wrapping vendor providers via
-  `integrations/sandbox_provider.py`). Notably their own comment says `BaseSandbox`
-  "does not reduce or partition the trust boundary" — it's about *where ops run*.
-- **pi** (`ssh.ts`): `createReadTool/createWriteTool/createBashTool` parametrized by
-  `ReadOperations / WriteOperations / BashOperations`. Plus extension examples
-  `sandbox/` (`@anthropic-ai/sandbox-runtime`) and `gondolin/` (route tools into a
-  micro-VM).
+But "A vs B" is the wrong axis. Both can use the *same* isolation primitive (e.g.
+Firecracker). The real difference is **where the marshaling boundary cuts:**
 
-**Both = harness on the host; tool execution routed through a swappable
-operations/backend interface.** Neither runs the whole harness *inside* a sandbox.
+| | **School A — sandbox as hands** | **School B — harness in sandbox** |
+|---|---|---|
+| Harness runs | on host | inside the VM |
+| Boundary crossed | **per tool op** (read/write/exec/grep) | **once** (prompt in, events out) |
+| In the trust boundary | file/shell side effects only | everything: harness, keys, egress, context |
+| Tools | RPC across the line each call | native local calls |
+| Protocol you maintain | one method per capability | just prompt/events |
+| TUI | host-native (snappy) | remote (over Transport) |
 
----
+> [!note] Firecracker needs a guest binary *either way*
+> Firecracker isn't ssh-into-a-box; you ship a guest rootfs with *something* that
+> services requests over vsock. So both schools put a Go binary in the VM — the only
+> question is **how much harness lives there**: a thin ops-shim (A, fat protocol) or
+> the whole harness (B, thin protocol). "Single static binary" helps both equally —
+> it is *not* the discriminator.
 
-## 2. The two schools
+### Why a *coding* agent leans B
 
-### School A — sandbox as *hands* (harness outside, tools reach in)
+Per-op (A) fights the things a coding agent needs, which are trivial when
+hands+brain+files are co-located (B): a coherent working tree (`cwd`, relative paths,
+symlinks), **background processes** (dev server, `watch`, test runner), **localhost
+tool-to-tool networking**, **LSPs/debuggers/REPLs** (long-lived, stateful, not
+request/response). In A each needs protocol surface; in B they "just work."
 
-The harness runs on the host; only **tool side effects** (read/write/exec/bash) are
-routed into a sandbox via an `Operations`/`Backend` interface (local, SSH, a microVM
-exec channel, or a vendor: E2B / Daytona / Modal / Runloop).
+### Where A genuinely wins
 
-- ✅ fine-grained (sandbox just `bash`, read files locally); keeps host-native TUI;
-  works with managed vendors at zero infra; matches pi/deepagents.
-- ❌ the boundary is **per-operation** — you must define & secure every op that
-  crosses in; **partial isolation** (harness, LLM keys, your context still on the
-  host); per-op marshaling latency; vendor API surface or you build the exec protocol.
+Host-native TUI; fine-grained fencing (sandbox only `bash`, read host paths
+directly); managed vendors (E2B/Daytona/Modal/Runloop) at zero infra; partial
+isolation that's often *sufficient* ("don't trash my machine").
 
-### School B — harness *inside* the sandbox (whole binary in a microVM)
+### Verdict — and the unifying design
 
-Boot a microVM/container with the **single Go binary + a full Linux env**. The whole
-harness runs inside; the host only **orchestrates** (provision VM, inject prompt/
-session, collect results/traces).
-
-- ✅ **complete isolation** in one boundary (harness, tools, scoped keys, network
-  policy); the harness code is *unaware of sandboxing* — it just runs on "a Linux
-  box," native fs/exec/bash at full speed, **no per-op marshaling**; the static
-  binary makes the VM image trivial (copy one file, no runtime deps); orchestration
-  is a clean separate layer; maps 1:1 onto the mesh (one agent = one VM, talking
-  over NATS).
-- ❌ coarser-grained (whole-VM, which is usually what you *want* for security); VM
-  boot latency (Firecracker ~125 ms — mitigate with pools/snapshots); the TUI is now
-  remote → needs the client/server frontend split (which we already designed).
-
----
-
-## 3. Which fits Go — and why it's nearly free here
-
-> [!success] Recommendation: **School B as the primary secure story; School A as a
-> lighter secondary seam.** And they compose.
-
-Go's defining trait — a **single static binary, no runtime deps, cross-compiled** —
-makes School B almost trivial: bake one file into a minimal rootfs and boot it. More
-importantly, **School B's requirements are the architecture we already have:**
-
-| School B needs | We already designed |
-|---|---|
-| drive a harness running elsewhere | headless core + client frontend (`Workspace`, §14) |
-| prompts in / events + traces out | the event stream over `Transport` (§12) |
-| resumable sessions | JSONL/store inside the VM (or a mounted volume) |
-| many isolated agents | one binary per microVM, coordinated over NATS (the mesh) |
-
-So "harness inside an ephemeral microVM, orchestrated and streamed from outside" is
-**not extra work — it's the natural consequence** of the headless-core +
-client-frontend + `Transport` design. The harness-in-the-box is the *server*; your
-TUI/orchestrator outside is the *client*; sessions resume from the in-VM store;
-prompts/results/traces flow over the same boundary.
-
-This also delivers exactly the separation you want: **we only do harness
-engineering; sandbox orchestration lives entirely outside the harness path.**
-
-### Keep School A as a seam too
-
-Still expose an `Operations` interface (read/write/exec/bash) à la pi/deepagents, so
-the *lightweight* case works without a full VM (e.g. sandbox just `bash` on the host,
-or route to a managed vendor). And the two **compose**: run the harness in a VM (B)
-*and* let its bash tool use an `Operations` backend (A) for nested isolation.
+Workload-dependent, **not** "Go ⇒ B." For a coding harness with strong isolation and
+the mesh, **lean B**. But build the **`Operations` seam regardless** — School B is
+just `Operations = local`:
 
 ```go
-// School A seam (lightweight / composable)
 type Operations interface {
     Exec(ctx, cmd, args) (Result, error)
-    Read(path) ([]byte, error); Write(path, b) error; Edit(...)
+    Read(p) ([]byte,error); Write(p,b) error; Edit(...); Grep(...); Glob(...)
 }
-// impls: Local | SSH | MicroVMExec | VendorSandbox(E2B/Daytona/Modal/Runloop)
+// Local (= School B, in-VM) | SSH | MicroVMExec | Vendor(E2B/Daytona/Modal/Runloop)
 ```
 
+The same harness then runs both ways; you choose at deploy time, not in code.
+
 ---
 
-## 4. MicroVM / isolation options (for School B orchestration)
+## 2. The sandbox wedge: B with a full isolated Linux VM
 
-| Tool | Lang | Notes |
+Keep it simple: **first sandbox wedge = the single binary running inside a full Linux
+VM**, driven over the `Workspace`/`Transport` boundary we already have (prompt in /
+events + traces out / resumable session = §14).
+
+> [!warning] Hardware reality on a Mac (M-series): Firecracker & Incus don't run natively
+> **Firecracker requires Linux + KVM** — macOS support is an experimental PoC only;
+> on Apple Silicon you'd nest it inside a Linux VM (don't, for dev). **Incus** also
+> needs a Linux kernel (on Mac it runs only *inside* a Lima/Colima Linux VM). So on
+> your M5, the host hypervisor is **Apple's Virtualization.framework**, and the
+> Firecracker-vs-Incus question is really a *Linux-deploy-target* question.
+
+**Pick per environment:**
+
+| Environment | Use | Why |
 |---|---|---|
-| **Firecracker** | Rust | minimal microVM, ~125 ms boot; `firecracker-go-sdk`; great for ephemeral per-task VMs |
-| **Cloud Hypervisor** | Rust | similar, modern devices |
-| **Incus** | Go | system containers **and** VMs, nice API/CLI; "full Linux env" |
-| **Kata Containers** | Go | run like OCI containers, isolated like VMs |
-| **gVisor** | Go | userspace kernel; lighter than a VM, strong syscall isolation (no full Linux) |
-| Managed (School A) | — | **E2B / Daytona / Modal / Runloop** — sandbox-as-a-service APIs |
+| **Mac M5 (dev)** | **Tart** (or Lima) on Virtualization.framework | native Apple-Silicon **full Linux VM**; Tart adds OCI image push/pull + snapshot/clone; near-native speed |
+| **Linux host (prod, ephemeral)** | **Firecracker** | ms snapshot/restore, warm pools, throwaway-per-task microVMs |
+| **Linux host (managed fleet)** | **Incus** | full VMs *and* containers, cloud-init, nice API/CLI |
 
-> [!note] Default secure story
-> Bake the static binary into a **Firecracker** (ephemeral, fast) or **Incus**
-> (full-Linux, persistent-ish) image; the in-VM harness speaks to the orchestrator
-> over **vsock / socket / NATS** — the same `Transport`. Orchestration (pooling,
-> snapshots, lifecycle) is a layer *outside* the harness, never on its hot path.
+**Wedge recommendation:** build on **Tart** on your M5 (full Linux VM, snapshots,
+versioned VM images), behind a `Sandbox` interface. Add a **Firecracker** driver for
+the Linux production path later. Same interface, swap the driver dev→prod.
+
+> Want full-VM (real-kernel) isolation specifically? That rules out plain
+> containers/Docker (shared kernel). Tart/Lima/Incus-VM/Firecracker all give a real
+> kernel boundary; LXC/Docker do not.
 
 ---
 
-## 5. The contract both schools share
+## 3. The three operations you asked about
 
-Whichever school, the harness must support: **prompt(s) in**, **events + results +
-traces out**, and **resumable sessions**. That's already the headless-mode +
-`Workspace`/`Transport` contract. So sandboxing doesn't add a new core requirement —
-it reuses the boundary we built for the UI and the mesh. One boundary, three uses:
-remote UI, mesh peers, sandbox orchestration.
+### 1. Snapshots
+- **Firecracker** — best-in-class: pause + snapshot full **memory + device state** to
+  files, restore in ~ms; boot-from-snapshot enables **warm pools** (clone a
+  pre-initialized agent per task). The gold standard.
+- **Tart** — `tart clone` (copy-on-write, fast) + reuse base images; "snapshot and
+  reuse states." Clone-from-image rather than live-memory, which is what you usually
+  want for per-task VMs anyway.
+- **Incus** — stateful/stateless snapshots + instance copy/clone. Solid, heavier.
+- *Easy everywhere; Firecracker is the most powerful, Tart the pragmatic Mac path.*
+
+### 2. Injecting data (repos, secrets)
+- **Repo:** mount a host folder (Tart `--dir`, Lima mounts, Incus shares) → live;
+  or `git clone` at boot; or bake into the **OCI VM image** (Tart) for reproducibility.
+- **Secrets:** never bake into the image. Inject **at boot over the control channel**
+  (vsock/ssh/Transport), scoped to the VM's lifetime. Firecracker has **MMDS**
+  (metadata service) for small secrets/config; Incus has **cloud-init**; Tart via
+  ssh/env/mounted file.
+- *Pattern: repo via mount-or-clone; secrets via post-boot control channel, never on disk.*
+
+### 3. Getting data out (outputs, files)
+- **Bulk files/outputs:** a **shared bidirectional mount** (host sees writes
+  instantly) or a **result volume** you detach and read. Tart/Lima/Incus fold this in;
+  `incus file pull`. (Firecracker has no virtiofs by default → use a shared **block
+  device** or stream over vsock — slightly more work.)
+- **Structured stream (events/traces/results):** over **vsock / ssh / the Transport**
+  — i.e. the harness's event stream (§12). This is also how traces leave the VM into
+  the observability store ([[observability-gameplan]]).
+- *Pattern: two channels — bulk files via mount/volume, structured events/traces via the Transport.*
+
+---
+
+## 4. The contract (same boundary, three uses)
+
+B's requirements — **prompt(s) in, events + results + traces out, resumable
+sessions** — are exactly the headless-mode + `Workspace`/`Transport` contract built
+for the UI and the mesh. Sandboxing adds no new core requirement; it reuses that one
+boundary. **One boundary, three uses: remote UI, mesh peers, sandbox orchestration** —
+and orchestration (pooling, snapshots, lifecycle) stays a layer *outside* the harness,
+never on its hot path.
